@@ -314,6 +314,18 @@ int tc_egress(struct __sk_buff *ctx) {
 
     __be32 curr_seq_num = tcp->seq;  // seq_num of current pkt (not updated)
     __be32 translated_seq_num = tcp->seq;  // (updated soon)
+
+    // Store highest sequence of data that got sent
+    __u32 highest_sent_data_len = 0;
+    struct ack_ingress_info *is_retransmit = bpf_map_lookup_elem(&ack_ingress_fix, &ack_ingress_key);
+    if (is_retransmit) {
+        highest_sent_data_len = is_retransmit->ack_ingress;
+    }
+    // Add packet SEQ + data_sent to map to serve as ACK on Ingress
+    struct ack_ingress_info ack_ingress_val = {
+        .ack_ingress = tcp->seq + bpf_htonl(tcp_payload_len),  // network-byte order
+    };
+    bpf_map_update_elem(&ack_ingress_fix, &ack_ingress_key, &ack_ingress_val, BPF_ANY);
     
     if (pad_bytes >= 4) {  // Need minimum of 4 bytes available for encoding original length | I can shrink the packet and add the leftover to next packet too.
         bpf_printk("Pad Bytes: %u. Packet length is < PMTU. Padding.\n", pad_bytes);
@@ -370,23 +382,11 @@ int tc_egress(struct __sk_buff *ctx) {
         // IPv4 tot_len fix
         ip->tot_len = bpf_htons(new_ip_len);
 
-        // Store highest sequence of data that got sent
-        __u32 highest_sent_data_len = NULL;
-        struct ack_ingress_info *is_retransmit = bpf_map_lookup_elem(&ack_ingress_fix, &ack_ingress_key);
-        if (is_retransmit) {
-            highest_sent_data_len = is_retransmit->ack_ingress;
-        }
-        // Add packet SEQ + data_sent to map to serve as ACK on Ingress
-        struct ack_ingress_info ack_ingress_val = {
-            .ack_ingress = tcp->seq + bpf_htonl(tcp_payload_len),  // network-byte order
-        };
-        bpf_map_update_elem(&ack_ingress_fix, &ack_ingress_key, &ack_ingress_val, BPF_ANY);
-
         // TCP SEQ FIX 
         struct seq_egress_info *seq_egress_info = bpf_map_lookup_elem(&seq_egress_fix, &seq_egress_key);
         if (seq_egress_info) {  // seq_num exists in the map already; update it and fix current pkt seq_num
             // Check if the current packet is retransmit
-            if (highest_sent_data_len && !(tcp->seq < highest_sent_data_len)) {  // packet is *NOT* retransmit
+            if (highest_sent_data_len && !(bpf_ntohl(tcp->seq) < highest_sent_data_len)) {  // packet is *NOT* retransmit
                 tcp->seq = seq_egress_info->seq_egress;  // No htonl as its already __be32
                 translated_seq_num = seq_egress_info->seq_egress;
                 struct seq_egress_info nxt_seq_val = {
@@ -477,11 +477,11 @@ int tc_egress(struct __sk_buff *ctx) {
     } else {
         /* Might need to see what to do here for the 1-3 last bytes which is not big enough for padding */
         bpf_printk("Packet length is >= PMTU. Don't Pad.\n");
+        // TCP SEQ FIX 
         // Check if the packet is the first packet of this flow
         struct seq_egress_info *seq_egress_info = bpf_map_lookup_elem(&seq_egress_fix, &seq_egress_key);
         if (seq_egress_info) {  // seq_num exists in the map already; not the first ever packet of this flow
-            // Check if it is a retransmit that is already big enough to pad
-            
+            /* No need to check for retransmit because I can't change anything else */
             tcp->seq = seq_egress_info->seq_egress;
             translated_seq_num = seq_egress_info->seq_egress;
             struct seq_egress_info nxt_seq_val = {
@@ -494,6 +494,9 @@ int tc_egress(struct __sk_buff *ctx) {
                 return TC_ACT_SHOT;
             }
         } // else: first ever packet of this flow that doesn't have enough space to pad
+        
+        // TCP ACK FIX 
+
     }
 
     return TC_ACT_OK;
