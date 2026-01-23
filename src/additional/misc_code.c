@@ -23,3 +23,11 @@
 // 2. can make pad_bytes a multiple of 4 mainly.
 // 3. can leave few bytes as 0 without random padding as 0s won't contribute to checksum and shift orig_len encoding from last 4 bytes to before.
         
+
+
+/* Encode original length to the last 4 bytes of the payload */
+// u8 *last4 = (u8 *)data_end - 4;  // Hoping data_end is linearized
+// // u8 *last4 = (u8 *)data + (mdf_pkt_len - 4);
+// if (!verifier_checker(last4, data_end, 4))
+//     return TC_ACT_SHOT;
+// __builtin_memcpy(last4, &pad_bytes, 4); 

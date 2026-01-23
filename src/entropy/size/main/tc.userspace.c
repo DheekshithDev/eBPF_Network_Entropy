@@ -14,7 +14,7 @@
 
 #include "tc_egress.bpf.skel.h"  // Generated skeleton header with Clang
 
-#define PKT_COUNT 1000  // Only for 1000 packets
+#define PKT_COUNT 1000  // Only for 1000 iterations (not packets)
 #define DEVICE_MTU 1500  // I always need to verify the device's MTU prior for this program to work perfectly
 #define MAX_PAD (DEVICE_MTU)
 
