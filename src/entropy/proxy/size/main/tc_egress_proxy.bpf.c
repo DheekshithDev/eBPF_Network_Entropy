@@ -1,27 +1,9 @@
-/***** This program might blow the recv window size of the remote server as the TCP state doesn't know about the tail padding this program does. *****/
-/***** This program currently ignores special packets from padding like pure-ACKs, 3-way handshake packets, etc. *****/
-/***** This program doesn't skip GSO/TSO packets. It expects you to disable them prior. *****/
-/***** This program doesn't skip GRO/LRO packets (but some devices disable it automatically when XDP is set). It expects you to disable them prior. *****/
-/**** If hardware checksum offload is enabled, might need to create a new path in code ****/
-/*****
- *This program computes checksum manually in software. To prevent hardware checksum computation again, it is advisable to turn TX/RX checksum off.
- *It is also possible to skip hardware checksum by passing certain flags, but it is not generally guaranteed.
- *Alternatively, it is possible to send *CHECKSUM_MANGLED* flag to let the hardware compute the checksum for your modified packet without doing it manually in this program.
- *****/
-/***** If your networking environment supports VLAN-tagged IPv4 frames (802.1Q/AD or IEEE 802.1Q), then it should be disabled for proper functioning as this program assumes eth->h_proto == 0x0800 without skipping any VLAN headers when parsing. *****/
-/***** This program expects you to hardcode the Device MTU in its DEVICE_MTU macro prior to running as PMTU is very salient for this program. *****/
 /***** This program doesn't fix SEQ Nums or ACKs of *RETRANSMIT* packets but pads it as usual *****/
 /**** PAD_BYTES should be max 1420 bytes on pure ACK packets with zero payload ****/
 
-/***** REMOVE bpf_printk()s IN PROD *****/
-
 /** Wireguard encapsulation overhead is ~60 bytes: Outer IPv4 header=20 + UDP header=8 + WireGuard data header w. crypto=~32 **/
 
-#include "tc.h"
-
-/* Declare *SHARED* maps once on main file */
-struct ack_ingress_fix_map ack_ingress_fix SEC(".maps");
-struct ack_egress_fix_map ack_egress_fix SEC(".maps");
+#include "tc_proxy.h"
 
 /* LRU HashMap for modifying SEQ_NUM on current packet */
 struct seq_egress_info {
@@ -46,25 +28,11 @@ struct {
     __uint(max_entries, 1);
 } rand_byte_map SEC(".maps");
 
-/* BPF_MAP_TYPE_PERCPU_ARRAY for storing pad_bytes (shared map but unique to each) */
-struct pad_state_map pad_state_map SEC(".maps");
-
-// Ring buffer map
-// struct {
-//     __uint(type, BPF_MAP_TYPE_RINGBUF);
-//     __uint(max_entries, 1 << 24);  // 16 MB Buffer
-// }rb SEC(".maps");
-
-// struct record {
-//     __u16 tcp_checksum;
-//     // __u32 orig_len;
-//     __u32 pad_bytes;
-// };
 
 SEC("tc")
 int tc_egress(struct __sk_buff *ctx) {
 
-    // return TC_ACT_OK;
+    return TC_ACT_OK;
 
     /*** This TC-Egress program is for padding the packets' tail to the full size of the PMTU. ***/
 
@@ -84,15 +52,6 @@ int tc_egress(struct __sk_buff *ctx) {
     void *data = (void *) (__u64) ctx->data;  // (unsigned long) == (__u64)
     void *data_end = (void *) (__u64) ctx->data_end;
 
-    // // Grab ETH Header
-    // struct ethhdr *eth = data;
-    // if (!verifier_checker(eth + 1, data_end, 0)) {
-    //     return TC_ACT_SHOT;
-    // }
-    // if (ctx->protocol == bpf_htons(ETH_P_IP)) {
-    //     bpf_printk("Packet is IPv4. \n");
-    //     // return TC_ACT_OK;
-    // }
     // Grab IP Header
     struct iphdr *ip = data;
     if (!verifier_checker(ip + 1, data_end, 0)) {
@@ -144,14 +103,9 @@ int tc_egress(struct __sk_buff *ctx) {
         return TC_ACT_OK;
 
     // Only use this program on client-proxy traffic  *CRITICAL*
-    if (ip->saddr != bpf_htonl(CLIENT_IP) || ip->daddr != bpf_htonl(TARGET_SITE)) {
+    if (ip->saddr != bpf_htonl(TARGET_SITE) || ip->daddr != bpf_htonl(CLIENT_IP)) {
         return TC_ACT_OK;
     }
-
-    // if (ip->saddr != bpf_htonl(CLIENT_IP) || tcp->dest != bpf_htons(4443)) {
-    //     return TC_ACT_OK;
-    // }
-    
 
     // IP total length field
     __u16 ip_len = bpf_ntohs(ip->tot_len);  
@@ -168,7 +122,7 @@ int tc_egress(struct __sk_buff *ctx) {
     }
 
     /* Start of Padding code */
-    /* Create ACK key to revert client ingress ACK to original */
+    /* Create ACK key to revert Client Ingress ACK to original */
     struct flow ack_ingress_key = {
         .saddr = ip->saddr,
         .daddr = ip->daddr,
@@ -199,44 +153,15 @@ int tc_egress(struct __sk_buff *ctx) {
 
     // Always add packet SEQ + data_sent to map to serve as ACK on Client Ingress
     struct ack_ingress_info ack_ingress_val = {
-        .ack_ingress = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len),  // network-byte order
+        .ack_ingress = tcp->seq + bpf_htonl(tcp_payload_len),  // network-byte order
     };
     bpf_map_update_elem(&ack_ingress_fix, &ack_ingress_key, &ack_ingress_val, BPF_ANY);
 
     __be32 curr_seq_num = tcp->seq;  // actual seq_num of current pkt (not updated)
     __be32 translated_seq_num = tcp->seq;  // *modified* seq_num of current pkt (will be updated)
 
-    __be32 curr_ack_num = tcp->ack_seq;  // actual ack_num of current pkt (not updated)
-    __be32 translated_ack_num = tcp->ack_seq;  // *modified* ack_num of current pkt (will be updated)
-
-    // // Grab Path MTU
-    // struct bpf_fib_lookup fib = {};
-    // fib.family = AF_INET;
-    // fib.ifindex = ctx->ifindex;
-    // fib.tos = ip->tos;
-    // fib.l4_protocol = IPPROTO_TCP;
-    // fib.sport = tcp->source;
-    // fib.dport = tcp->dest;
-    // fib.ipv4_src = ip->saddr;
-    // fib.ipv4_dst = ip->daddr;
-    // fib.tot_len = bpf_htons(ip_len + (DEVICE_MTU - ip_len));  // Always push it to trigger FIB_FRAGMENTATION_NEEDED
-
-    // long ret = bpf_fib_lookup(ctx, &fib, sizeof(fib), BPF_FIB_LOOKUP_OUTPUT);
-
-    // __u32 p_mtu = 0;
-    // if (ret == BPF_FIB_LKUP_RET_FRAG_NEEDED || ret == 0) {
-    //     // Use only when it returns successfully; don't use when it fails and *may* contain garbage value as MTU
-    //     p_mtu = fib.mtu_result;
-    // }
-    // if (p_mtu <= 0) {
-    //     bpf_printk("Something went wrong with FIB_MTU lookup.");
-    //     // return TC_ACT_SHOT;
-    // }
-    // p_mtu = p_mtu ?: DEVICE_MTU;  // p_mtu is the TARGET I want to pad till.
-    // bpf_printk("The PMTU is: %u\n", p_mtu);
-
     __u32 p_mtu = DEVICE_MTU;
-    
+
     __u32 pad_bytes = 0;
     if (p_mtu && (p_mtu > ip_len)) {
         pad_bytes = (p_mtu - ip_len);  // max legally can be 1420
@@ -247,40 +172,25 @@ int tc_egress(struct __sk_buff *ctx) {
     if (pad_bytes > MAX_PAD)
         pad_bytes = MAX_PAD;
 
-    __u32 k0 = 0;
-    struct pad_state *pad_st = bpf_map_lookup_elem(&pad_state_map, &k0);
+    __u32 k1 = 1;
+    struct pad_state *pad_st = bpf_map_lookup_elem(&pad_state_map, &k1);
     if (!pad_st) return TC_ACT_SHOT;
+
     pad_st->pad_bytes = pad_bytes;
 
     // Get current packet length from L3 for WireGuard
     __u32 init_pkt_len = ctx->len;
-    
-    if (pad_bytes >= 4) {  // Need minimum of 4 bytes available for encoding original length | I can shrink the packet and add the leftover to next packet too.
-        // bpf_printk("Pad Bytes: %u.\n", pad_bytes);
-        // struct record *ringbuf_rec = bpf_ringbuf_reserve(&rb, sizeof(struct record), 0);
-        // if (!ringbuf_rec) {
-        //     return TC_ACT_OK;
-        // }
-        // ringbuf_rec->tcp_checksum = bpf_ntohs(tcp->check);
-        // ringbuf_rec->pad_bytes = pad_bytes;
-        // // Submit data to ring buffer
-        // bpf_ringbuf_submit(ringbuf_rec, 0);
 
-        if (bpf_skb_change_tail(ctx, init_pkt_len + pad_bytes, 0)) {  // NTC BPF_F_INVALIDATE_HASH flag here; I can also skip bpf_set_hash_invalid() because this is not TC-Ingress RX path
+    if (pad_bytes >= 4) { 
+        if (bpf_skb_change_tail(ctx, init_pkt_len + pad_bytes, 0)) {
             bpf_printk("Error with changing tail to the packet!\n");
             return TC_ACT_SHOT;
         }
 
         /* Perform Verifier Checks Again */
         data = (void *) (__u64) ctx->data;  // (unsigned long) == (u64)
-        data_end = (void *) (__u64) ctx->data_end;  // This should point to payload end because bpf_skb_change_tail internally linearizes the whole packet
+        data_end = (void *) (__u64) ctx->data_end;
 
-        // // Grab ETH Header
-        // eth = data;
-        // if (!verifier_checker(eth + 1, data_end, 0)) {
-        //     return TC_ACT_SHOT;
-        // }
-        
         // Grab IP Header
         ip = data;
         if (!verifier_checker(ip + 1, data_end, 0)) {
@@ -305,16 +215,12 @@ int tc_egress(struct __sk_buff *ctx) {
             bpf_printk("Failed at mod tcp hl.\n");
             return TC_ACT_SHOT;
         }
-        // u8 *tail = (u8 *)data + init_pkt_len;
-        // if (!verifier_checker(tail, data_end, pad_bytes))
-        //     return TC_ACT_SHOT;
-        
+
         __u16 new_ip_len = ip_len + pad_bytes;
         if (new_ip_len > 65535) {  // Something went wrong
             bpf_printk("Failed at mod iplen.\n");
             return TC_ACT_SHOT;
         }
-        
         
         /* Update all fields first before actual writing */
         // IPv4 tot_len fix
@@ -334,27 +240,6 @@ int tc_egress(struct __sk_buff *ctx) {
                     .seq_egress = bpf_htonl(bpf_ntohl(mdf_seq) + tcp_payload_len_modified),
                 };
                 bpf_map_update_elem(&seq_egress_fix, &seq_egress_key, &nxt_seq_val, BPF_ANY);  // only update
-
-                // TCP ACK FIX
-                // if (tcp->ack) {  // Only if ACK bit is set
-                //     struct ack_egress_info *ack_egress_info = bpf_map_lookup_elem(&ack_egress_fix, &ack_egress_key);
-                //     if (ack_egress_info) {
-                //         __be32 orig_ack = ack_egress_info->ack_egress_orig;
-                //         __be32 mdf_ack = ack_egress_info->ack_egress;
-                //         if (tcp->ack_seq == orig_ack) {  // check if the ACK is what I expect with ==
-                //             if (orig_ack != mdf_ack) {  // no update needed for unpadded packets on Client Ingress
-                //                 tcp->ack_seq = mdf_ack;
-                //                 translated_ack_num = mdf_ack;
-                //             }
-                            
-                //         } else {  // (tcp->ack_seq *SHOULD NEVER* be > than orig_ack)
-                //             // tcp->ack_seq is < orig_ack; pkt is dropped and next pkt from me would be retransmit;
-                //             bpf_printk("Data lost. Next pkt will be retransmit.\n");
-                //         }
-                
-
-                //     }
-                // }
             }
         } else {  // First packet entry that needs padding
             struct seq_egress_info nxt_seq_val = {
@@ -363,38 +248,15 @@ int tc_egress(struct __sk_buff *ctx) {
             bpf_map_update_elem(&seq_egress_fix, &seq_egress_key, &nxt_seq_val, BPF_NOEXIST);  // BPF_NOEXIST secondary defense
         }
 
+        // TCP ACK FIX
+        // Check if the ACK is what I expect with ==, if it is < what I expect, it could mean data is lost and next pkt would be retransmit
+
+        /* Write random payload to packet but leave last 4 bytes */
         __s64 tot_diff = 0;
 
         __u32 pb = pad_st->pad_bytes;
         if (pb > MAX_PAD) 
             pb = MAX_PAD;
-
-        if (pb > 4) {
-            /* Write random payload to packet but leave last 4 bytes */
-            __u32 key = 0;
-            struct rand_byte_buff *rbb = bpf_map_lookup_elem(&rand_byte_map, &key);
-            if (!rbb) { 
-                bpf_printk("Failed at rbb.\n");
-                return TC_ACT_SHOT;
-            }
-            // // Random offset of bytes for randomizing
-            // __u32 space = MAX_PAD - max_load;
-            // __u32 rand_off = 0;
-            // if (space)
-            //     rand_off = bpf_get_prandom_u32() % (space);
-            // if (rand_off > MAX_PAD - max_load)
-            //     rand_off = 0;
-
-            if (bpf_skb_store_bytes(ctx, init_pkt_len, rbb->bytes, pb - 4, 0)) {  // leave last 4 bytes for original length
-                bpf_printk("Failed at store bytes rbb.\n");
-                return TC_ACT_SHOT;
-            }
-            tot_diff = csum_diff_u8_buf(rbb->bytes, pb - 4, 0);  // Random payload csum diff
-            if (tot_diff < 0) {  // Returns negative code in failure
-                bpf_printk("Failed at tot_diff.\n");
-                return TC_ACT_SHOT;
-            }
-        }
 
         // RC5 Encrypt
         __u16 a = PAD_MAGIC16;
@@ -425,7 +287,7 @@ int tc_egress(struct __sk_buff *ctx) {
             bpf_printk("Failed at store bytes mtail.\n");
             return TC_ACT_SHOT;
         }
-        
+
         /* If hardware checksum offload is enabled */
         // Different code here  // NTC THIS PATH TOO AS IT COULD BE FASTER
 
@@ -457,7 +319,6 @@ int tc_egress(struct __sk_buff *ctx) {
 
     } else {
         /* Might need to see what to do here for the 1-3 last bytes which is not big enough for padding */
-        // bpf_printk("Packet length is >= PMTU. Don't Pad.\n");
 
         // TCP SEQ FIX 
         // Check if the packet is the first packet of this flow
@@ -471,7 +332,7 @@ int tc_egress(struct __sk_buff *ctx) {
                 struct seq_egress_info nxt_seq_val = {
                     .seq_egress = bpf_htonl(bpf_ntohl(mdf_seq) + tcp_payload_len),
                 };
-                bpf_map_update_elem(&seq_egress_fix, &seq_egress_key, &nxt_seq_val, BPF_ANY);
+                bpf_map_update_elem(&seq_egress_fix, &seq_egress_key, &nxt_seq_val, BPF_EXIST);
                 // L4-TCP SEQ checksum replace
                 if (bpf_l4_csum_replace(ctx, ip_hl + offsetof(struct tcphdr, check), curr_seq_num, translated_seq_num, 4)) {  // all network-byte order
                     bpf_printk("Something went wrong with TCP->SEQ l4_csum_replace().\n");
