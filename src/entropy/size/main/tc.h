@@ -1,3 +1,4 @@
+#pragma once
 #include "vmlinux.h"
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
@@ -20,6 +21,8 @@
 /* Simple RC5 */
 #define RC5_R 12u
 #define RC5_T (2 * (RC5_R + 1))  // 16-bit words
+
+_Static_assert(MAX_CHUNKS * CSUM_CHUNK >= MAX_PAD, "CSUM chunking too small. Failing!");
 
 /*** DATA TYPES ***/
 /* Tail for all *modified* packets */
@@ -151,7 +154,6 @@ static __always_inline __s64 csum_diff_u8_buf(const __u8 *buf, __u32 len, __u32 
         }
     #endif
 
-    // tail (0..3)
     __u32 n4 = (len & ~3u);      // last 4-aligned boundary
     __u32 rem = len & 3u;
     if (rem) {
@@ -164,43 +166,6 @@ static __always_inline __s64 csum_diff_u8_buf(const __u8 *buf, __u32 len, __u32 
     }
 
     return diff;
-    
-    // __u32 off = 0;
-    // __s64 diff = 0;
-
-// #pragma unroll  // Loop for iterating in chunk sizes as bpf_csum_diff can't accept bytes > ~500
-    // for (__u32 i = 0; i < MAX_CHUNKS; i++) {
-    //     if (off >= len)
-    //         break;
-
-    //     __u32 n = len - off;
-    //     if (n > CSUM_CHUNK)
-    //         n = CSUM_CHUNK;
-
-    //     n &= ~3u;  // multiple of 4; optional as I don't need it explicitly
-    //     if (!n)
-    //         break;
-
-    //     diff = bpf_csum_diff(0, 0, (__be32 *)(buf + off), n, seed);  // initial seed is 0 always
-    //     if (diff < 0)
-    //         return diff;
-
-    //     seed = (__u32)diff;
-    //     off += n;
-    // }
-
-    // __u32 rem = len - off;
-    // if (rem) {
-    //     __u32 last = 0; // zero-padded
-    //     if (rem >= 1) ((__u8 *)&last)[0] = buf[off + 0];
-    //     if (rem >= 2) ((__u8 *)&last)[1] = buf[off + 1];
-    //     if (rem >= 3) ((__u8 *)&last)[2] = buf[off + 2];
-
-    //     diff = bpf_csum_diff(0, 0, (__be32 *)&last, 4, seed);
-    //     if (diff < 0)
-    //         return diff;
-    // }
-    // return diff;
 }
 
 /* RC5 */

@@ -28,11 +28,20 @@ struct {
     __uint(max_entries, 1);
 } rand_byte_map SEC(".maps");
 
+/* HAD to use this BPF_MAP_TYPE_PERCPU_ARRAY for csum recomputation */
+// Value //
+struct rand_byte_buff_holder {
+    __u8 bytes[RAND_BUF_SZ];
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);  // PERCPU because of concurrent packet writes
+    __type(key, __u32);
+    __type(value, struct rand_byte_buff_holder);
+    __uint(max_entries, 1);
+} rand_byte_holder_map SEC(".maps");
 
 SEC("tc")
 int tc_egress(struct __sk_buff *ctx) {
-
-    return TC_ACT_OK;
 
     /*** This TC-Egress program is for padding the packets' tail to the full size of the PMTU. ***/
 
@@ -175,7 +184,6 @@ int tc_egress(struct __sk_buff *ctx) {
     __u32 k1 = 1;
     struct pad_state *pad_st = bpf_map_lookup_elem(&pad_state_map, &k1);
     if (!pad_st) return TC_ACT_SHOT;
-
     pad_st->pad_bytes = pad_bytes;
 
     // Get current packet length from L3 for WireGuard
@@ -252,11 +260,23 @@ int tc_egress(struct __sk_buff *ctx) {
         // Check if the ACK is what I expect with ==, if it is < what I expect, it could mean data is lost and next pkt would be retransmit
 
         /* Write random payload to packet but leave last 4 bytes */
-        __s64 tot_diff = 0;
+        __u32 key = 0;
+        struct rand_byte_buff *rbb = bpf_map_lookup_elem(&rand_byte_map, &key);
+        if (!rbb) { 
+            bpf_printk("Failed at rbb.\n");
+            return TC_ACT_SHOT;
+        }
 
+        /* Write random payload to packet but leave last 4 bytes */
         __u32 pb = pad_st->pad_bytes;
         if (pb > MAX_PAD) 
             pb = MAX_PAD;
+        if (pb > 4) {
+            if (bpf_skb_store_bytes(ctx, init_pkt_len, rbb->bytes, pb - 4, 0)) {  // leave last 4 bytes for original length
+                bpf_printk("Failed at store bytes rbb.\n");
+                return TC_ACT_SHOT;
+            }
+        }
 
         // RC5 Encrypt
         __u16 a = PAD_MAGIC16;
@@ -268,16 +288,9 @@ int tc_egress(struct __sk_buff *ctx) {
             .magic = bpf_htons(a),
             .pad_len = bpf_htons(b),
         };
-        __s64 d2 = bpf_csum_diff(0, 0, (__be32 *)&mtail, sizeof(mtail), (__u32)tot_diff);  // sizeof(mtail) = 4
-        if (d2 < 0) {
-            bpf_printk("Failed at d2.\n");
-            return TC_ACT_SHOT;
-        }
-        tot_diff = d2;
 
         // Get *modified* packet length
         __u32 mdf_pkt_len = ctx->len;
-
         if (mdf_pkt_len < (int)sizeof(mtail)) {
             bpf_printk("Failed at mdf_len.\n");
             return TC_ACT_SHOT;
@@ -285,6 +298,82 @@ int tc_egress(struct __sk_buff *ctx) {
         // Only need to copy pad_bytes which I can use to undo every change I made
         if (bpf_skb_store_bytes(ctx, (mdf_pkt_len - sizeof(mtail)), &mtail, sizeof(mtail), 0)) {
             bpf_printk("Failed at store bytes mtail.\n");
+            return TC_ACT_SHOT;
+        }
+
+        /* Perform Verifier Checks Again */
+        data = (void *) (__u64) ctx->data;  // (unsigned long) == (u64)
+        data_end = (void *) (__u64) ctx->data_end;
+
+        // Grab IP Header
+        ip = data;
+        if (!verifier_checker(ip + 1, data_end, 0)) {
+            bpf_printk("Failed at mod iphr.\n");
+            return TC_ACT_SHOT;
+        }
+        // Calculate IP Header length
+        ip_hl = ip->ihl * 4;
+        if (!verifier_checker(ip, data_end, ip_hl)) {
+            bpf_printk("Failed at mod iphr hl.\n");
+            return TC_ACT_SHOT;
+        }
+        // Grab TCP Header
+        tcp = (struct tcphdr *) ((void *) ip + ip_hl);
+        if (!verifier_checker(tcp + 1, data_end, 0)) {
+            bpf_printk("Failed at mod tcphdr.\n");
+            return TC_ACT_SHOT;
+        }
+        // Calculate TCP Header length
+        tcp_hl = tcp->doff * 4;
+        if (!verifier_checker(tcp, data_end, tcp_hl)) {
+            bpf_printk("Failed at mod tcp hl.\n");
+            return TC_ACT_SHOT;
+        }
+
+        // Setup temp buffer for csum calc
+        __u32 i_key = 0;  // index key
+        struct rand_byte_buff_holder *rbbh = bpf_map_lookup_elem(&rand_byte_holder_map, &i_key);
+        if (!rbbh) {
+            bpf_printk("Failed at rbb.\n");
+            return TC_ACT_SHOT;
+        }
+
+        __s64 tot_diff = 0;
+
+        if (tcp_payload_len & 1) {
+            __u8 last = 0;
+            if (bpf_skb_load_bytes(ctx, init_pkt_len - 1, &last, 1))  // last byte of actual payload
+                return TC_ACT_SHOT;
+
+            if (bpf_skb_load_bytes(ctx, init_pkt_len, rbbh->bytes, pb)) {
+                bpf_printk("Failed at load bytes rbbh 1.\n");
+                return TC_ACT_SHOT;
+            }
+
+            __u8 pad0 = rbbh->bytes[0];
+
+            // bpf_csum_diff only accepts multiples of 4 for length param
+            __be32 old32 = bpf_htonl(((__u32)last << 24) | ((__u32)0x00 << 16));
+            __be32 new32 = bpf_htonl(((__u32)last << 24) | ((__u32)pad0 << 16));
+            
+            tot_diff = bpf_csum_diff(&old32, 4, &new32, 4, 0);
+            if (tot_diff < 0) {
+                bpf_printk("Failed bridge diff\n");
+                return TC_ACT_SHOT;
+            }
+
+            tot_diff = csum_diff_u8_buf(&rbbh->bytes[1], pb - 1, (__u32)tot_diff);
+
+        } else {
+            if (bpf_skb_load_bytes(ctx, init_pkt_len, rbbh->bytes, pb)) {
+                bpf_printk("Failed at load bytes rbbh 2.\n");
+                return TC_ACT_SHOT;
+            }
+            tot_diff = csum_diff_u8_buf(rbbh->bytes, pb, 0);
+        }
+
+        if (tot_diff < 0) {
+            bpf_printk("Failed at tot_diff\n");
             return TC_ACT_SHOT;
         }
 

@@ -169,9 +169,11 @@ int tc_ingress(struct __sk_buff *ctx) {
     };
     bpf_map_update_elem(&ack_egress_fix, &ack_egress_key, &ack_egress_val, BPF_ANY);
 
+    __be32 translated_seq_num = tcp->seq;  // *modified* seq_num of current pkt
+    __be32 orig_seq_num = tcp->seq;  // *actual* seq_num of current pkt (will be updated)
+
     // *Modified* packet length
     __u32 mdf_pkt_len = ctx->len;  // could be untampered normal packets too
-    // bpf_printk("Modified packet length is: %u\n", mdf_pkt_len);
 
     /* Start of *UNDO* Padding code */
     // Read the last 4 bytes of the packet for original length of packet
@@ -180,7 +182,6 @@ int tc_ingress(struct __sk_buff *ctx) {
         bpf_printk("Failed at mtail mdf_pkt_len.\n");
         return TC_ACT_SHOT;
     }
-
     if (bpf_skb_load_bytes(ctx, (mdf_pkt_len - sizeof(mtail)), &mtail, sizeof(mtail))) {
         bpf_printk("Failed at load bytes mtail.\n");
         return TC_ACT_SHOT;
@@ -190,9 +191,6 @@ int tc_ingress(struct __sk_buff *ctx) {
     __u16 a = bpf_ntohs(mtail.magic);
     __u16 b = bpf_ntohs(mtail.pad_len);
     rc5_16_decrypt(&a, &b);
-
-    __be32 translated_seq_num = tcp->seq;  // *modified* seq_num of current pkt
-    __be32 orig_seq_num = tcp->seq;  // *actual* seq_num of current pkt (will be updated)
     
     if (a == PAD_MAGIC16) {  // magic seq found; packet is tampered
         __u32 pad_bytes = (__u32)b;
@@ -203,17 +201,14 @@ int tc_ingress(struct __sk_buff *ctx) {
         if (!pad_st) return TC_ACT_SHOT;
         pad_st->pad_bytes = pad_bytes;
 
-        __s64 tot_diff = 0;
-
         __u32 i_key = 0;  // index key
-        struct rand_byte_buff_holder *rbb = bpf_map_lookup_elem(&rand_byte_holder_map, &i_key);
-        if (!rbb) {
-            bpf_printk("Failed at rbb.\n");
+        struct rand_byte_buff_holder *rbbh = bpf_map_lookup_elem(&rand_byte_holder_map, &i_key);
+        if (!rbbh) {
+            bpf_printk("Failed at rbbh.\n");
             return TC_ACT_SHOT;
         }
 
         __u32 pb = pad_st->pad_bytes;
-        // __u32 pb = (__u32)b;
         if (pb > MAX_PAD)   // corrupted
             return TC_ACT_SHOT;
         if (pb > mdf_pkt_len)   // corrupted
@@ -222,16 +217,9 @@ int tc_ingress(struct __sk_buff *ctx) {
             return TC_ACT_SHOT;
 
         // Store the random padded bytes to BPF_MAP for csum calc
-        if (pb > 4) {
-            if (bpf_skb_load_bytes(ctx, mdf_pkt_len - pb, rbb->bytes, pb - 4)) {
-                bpf_printk("Failed at load bytes rbb.\n");
-                return TC_ACT_SHOT;
-            }
-            tot_diff = csum_sub_u8_buf(rbb->bytes, pb - 4, 0);  // Random payload csum diff for *removal*
-            if (tot_diff < 0) {
-                bpf_printk("Failed at tot_diff.\n");
-                return TC_ACT_SHOT;
-            }
+        if (bpf_skb_load_bytes(ctx, mdf_pkt_len - pb, rbbh->bytes, pb)) {
+            bpf_printk("Failed at load bytes rbbh.\n");
+            return TC_ACT_SHOT;
         }
 
         // UNDO padding
@@ -324,15 +312,52 @@ int tc_ingress(struct __sk_buff *ctx) {
         // Check if the ACK is what I expect with ==, if it is < what I expect, it could mean data is lost and next pkt would be retransmit
         
         // Get original packet length
-        // __u32 init_pkt_len = ctx->len;
-    
+        __u32 init_pkt_len = ctx->len;
 
-        __s64 d2 = bpf_csum_diff((__be32 *)&mtail, sizeof(mtail), 0, 0, (__u32)tot_diff);  // sizeof(mtail) = 4
-        if (d2 < 0) {
-            bpf_printk("Failed at d2.\n");
+        __s64 tot_diff = 0;
+
+        if (tcp_payload_len_orig & 1) {
+            __u8 last = 0;
+            if (bpf_skb_load_bytes(ctx, init_pkt_len - 1, &last, 1))  // last byte of actual payload
+                return TC_ACT_SHOT;
+
+            __u8 pad0 = rbbh->bytes[0];
+
+            // __u8 oldb[2] = { last, pad0 };
+            // __u8 newb[2] = { last, 0x00 };
+            // bpf_csum_diff only accepts multiples of 4 for length param
+            __be32 old32 = bpf_htonl(((__u32)last << 24) | ((__u32)pad0 << 16));
+            __be32 new32 = bpf_htonl(((__u32)last << 24) | ((__u32)0x00 << 16));
+
+            tot_diff = bpf_csum_diff(&old32, 4, &new32, 4, 0);
+            if (tot_diff < 0) {
+                bpf_printk("Failed bridge diff\n");
+                return TC_ACT_SHOT;
+            }
+
+            tot_diff = csum_sub_u8_buf(&rbbh->bytes[1], pb - 1, (__u32)tot_diff);
+        
+        } else {
+            tot_diff = csum_sub_u8_buf(rbbh->bytes, pb, 0);
+        }
+
+        if (tot_diff < 0) {
+            bpf_printk("Failed at tot_diff\n");
             return TC_ACT_SHOT;
         }
-        tot_diff = d2;
+        
+        // tot_diff = csum_sub_u8_buf(rbbh->bytes, pb - 4, 0);  // Random payload csum diff for *removal*
+        // if (tot_diff < 0) {
+        //     bpf_printk("Failed at tot_diff.\n");
+        //     return TC_ACT_SHOT;
+        // }
+    
+        // __s64 d2 = bpf_csum_diff((__be32 *)&mtail, sizeof(mtail), 0, 0, (__u32)tot_diff);  // sizeof(mtail) = 4
+        // if (d2 < 0) {
+        //     bpf_printk("Failed at d2.\n");
+        //     return TC_ACT_SHOT;
+        // }
+        // tot_diff = d2;
 
         // L3-IP checksum replace to original
         if (bpf_l3_csum_replace(ctx, offsetof(struct iphdr, check), bpf_htons(ip_len_modified), bpf_htons(ip_len), 2)) {
@@ -385,7 +410,6 @@ int tc_ingress(struct __sk_buff *ctx) {
     }
 
     return TC_ACT_OK;
-
 }
 
 

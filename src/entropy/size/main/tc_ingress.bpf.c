@@ -17,21 +17,19 @@ struct {  // I maintain this for myself
 
 /* HAD to use this BPF_MAP_TYPE_PERCPU_ARRAY for csum recomputation */
 // Value //
-// struct rand_byte_buff_holder {
-//     __u8 bytes[RAND_BUF_SZ];
-// };
-// struct {
-//     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);  // PERCPU because of concurrent packet writes
-//     __type(key, __u32);
-//     __type(value, struct rand_byte_buff_holder);
-//     __uint(max_entries, 1);
-// } rand_byte_holder_map SEC(".maps");
+struct rand_byte_buff_holder {
+    __u8 bytes[RAND_BUF_SZ];
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);  // PERCPU because of concurrent packet writes
+    __type(key, __u32);
+    __type(value, struct rand_byte_buff_holder);
+    __uint(max_entries, 1);
+} rand_byte_holder_map SEC(".maps");
 
 
 SEC("tc")
 int tc_ingress(struct __sk_buff *ctx) {
-
-    return TC_ACT_OK;
 
     /* Need to disable TSO/GSO on all network profiles */
     // Ignore GSO/TSO Packets still; *SHOULDN'T* see them in trace files
@@ -152,6 +150,9 @@ int tc_ingress(struct __sk_buff *ctx) {
     };
     bpf_map_update_elem(&ack_egress_fix, &ack_egress_key, &ack_egress_val, BPF_ANY);
 
+    __be32 translated_seq_num = tcp->seq;  // *modified* seq_num of current pkt
+    __be32 orig_seq_num = tcp->seq;  // *actual* seq_num of current pkt (will be updated)
+
     // *Modified* packet length
     __u32 mdf_pkt_len = ctx->len;  // could be untampered normal packets too
 
@@ -162,7 +163,6 @@ int tc_ingress(struct __sk_buff *ctx) {
         bpf_printk("Failed at mtail mdf_pkt_len.\n");
         return TC_ACT_SHOT;
     }
-
     if (bpf_skb_load_bytes(ctx, (mdf_pkt_len - sizeof(mtail)), &mtail, sizeof(mtail))) {
         bpf_printk("Failed at load bytes mtail.\n");
         return TC_ACT_SHOT;
@@ -172,9 +172,6 @@ int tc_ingress(struct __sk_buff *ctx) {
     __u16 a = bpf_ntohs(mtail.magic);
     __u16 b = bpf_ntohs(mtail.pad_len);
     rc5_16_decrypt(&a, &b);
-
-    __be32 translated_seq_num = tcp->seq;  // *modified* seq_num of current pkt
-    __be32 orig_seq_num = tcp->seq;  // *actual* seq_num of current pkt (will be updated)
     
     if (a == PAD_MAGIC16) {  // magic seq found; packet is tampered
         __u32 pad_bytes = (__u32)b;
@@ -184,6 +181,13 @@ int tc_ingress(struct __sk_buff *ctx) {
         if (!pad_st) return TC_ACT_SHOT;
         pad_st->pad_bytes = pad_bytes;
 
+        __u32 i_key = 0;  // index key
+        struct rand_byte_buff_holder *rbbh = bpf_map_lookup_elem(&rand_byte_holder_map, &i_key);
+        if (!rbbh) {
+            bpf_printk("Failed at rbbh.\n");
+            return TC_ACT_SHOT;
+        }
+
         __u32 pb = pad_st->pad_bytes;
         if (pb > MAX_PAD)   // corrupted
             return TC_ACT_SHOT;
@@ -191,6 +195,12 @@ int tc_ingress(struct __sk_buff *ctx) {
             return TC_ACT_SHOT;
         if (pb == 0)   // corrupted
             return TC_ACT_SHOT;
+
+        // Store the random padded bytes to BPF_MAP for csum calc
+        if (bpf_skb_load_bytes(ctx, mdf_pkt_len - pb, rbbh->bytes, pb)) {
+            bpf_printk("Failed at load bytes rbbh.\n");
+            return TC_ACT_SHOT;
+        }
 
         // UNDO padding
         if (bpf_skb_change_tail(ctx, mdf_pkt_len - pb, 0)) {  // NTC BPF_F_INVALIDATE_HASH flag here;
@@ -266,10 +276,38 @@ int tc_ingress(struct __sk_buff *ctx) {
         // TCP ACK FIX
         // Check if the ACK is what I expect with ==, if it is < what I expect, it could mean data is lost and next pkt would be retransmit
         
+        // Get original packet length
+        __u32 init_pkt_len = ctx->len;
 
-        __s64 tot_diff = bpf_csum_diff((__be32 *)&mtail, sizeof(mtail), 0, 0, 0);  // sizeof(mtail) = 4
+        __s64 tot_diff = 0;
+
+        if (tcp_payload_len_orig & 1) {
+            __u8 last = 0;
+            if (bpf_skb_load_bytes(ctx, init_pkt_len - 1, &last, 1))  // last byte of actual payload
+                return TC_ACT_SHOT;
+
+            __u8 pad0 = rbbh->bytes[0];
+
+            // __u8 oldb[2] = { last, pad0 };
+            // __u8 newb[2] = { last, 0x00 };
+            // bpf_csum_diff only accepts multiples of 4 for length param
+            __be32 old32 = bpf_htonl(((__u32)last << 24) | ((__u32)pad0 << 16));
+            __be32 new32 = bpf_htonl(((__u32)last << 24) | ((__u32)0x00 << 16));
+
+            tot_diff = bpf_csum_diff(&old32, 4, &new32, 4, 0);
+            if (tot_diff < 0) {
+                bpf_printk("Failed bridge diff\n");
+                return TC_ACT_SHOT;
+            }
+
+            tot_diff = csum_sub_u8_buf(&rbbh->bytes[1], pb - 1, (__u32)tot_diff);
+        
+        } else {
+            tot_diff = csum_sub_u8_buf(rbbh->bytes, pb, 0);
+        }
+
         if (tot_diff < 0) {
-            bpf_printk("Failed at d2.\n");
+            bpf_printk("Failed at tot_diff\n");
             return TC_ACT_SHOT;
         }
 
@@ -325,7 +363,6 @@ int tc_ingress(struct __sk_buff *ctx) {
     }
 
     return TC_ACT_OK;
-
 }
 
 char __license[] SEC("license") = "GPL";
