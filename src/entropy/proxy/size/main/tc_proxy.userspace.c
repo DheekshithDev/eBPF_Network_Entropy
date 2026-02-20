@@ -162,12 +162,12 @@ int main(int argc, char **argv) {
     }
 
     // Random bytes code
-    // fd = bpf_map__fd(skel->maps.rand_byte_map);
-    // if (fd < 0) {err = 1; goto cleanup;}
-    // if (initialize_array(fd) != 0) {
-    //     err = 1;
-    //     goto cleanup;
-    // }
+    fd = bpf_map__fd(skel->maps.rand_byte_map);
+    if (fd < 0) {err = 1; goto cleanup;}
+    if (initialize_array(fd) != 0) {
+        err = 1;
+        goto cleanup;
+    }
 
     printf("Successfully attached TC program! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
            "to see output of the BPF program.\n");
@@ -198,10 +198,18 @@ int main(int argc, char **argv) {
 
     /* Loop to stop program from terminating */
     int i = 0;
+    __u64 init_time = nsec_now();
+    __u64 curr_time = 0;
     while(!exiting && i < PKT_COUNT) {
         fprintf(stderr, "*********\n");
         sleep(2);  // Need to remove this in production
         i++;
+        curr_time = nsec_now();
+        if (curr_time - init_time > 10ull * 1000000000ull) {
+            if (initialize_array(fd) == 0) {
+                init_time = curr_time; 
+            }
+        }
     }
 
 cleanup:

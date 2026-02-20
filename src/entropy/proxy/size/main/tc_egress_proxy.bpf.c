@@ -38,7 +38,7 @@ struct {
     __type(key, __u32);
     __type(value, struct rand_byte_buff_holder);
     __uint(max_entries, 1);
-} rand_byte_holder_map SEC(".maps");
+} rand_byte_holder_map_eg SEC(".maps");
 
 SEC("tc")
 int tc_egress(struct __sk_buff *ctx) {
@@ -112,9 +112,9 @@ int tc_egress(struct __sk_buff *ctx) {
         return TC_ACT_OK;
 
     // Only use this program on client-proxy traffic  *CRITICAL*
-    if (ip->saddr != bpf_htonl(TARGET_SITE) || ip->daddr != bpf_htonl(CLIENT_IP)) {
-        return TC_ACT_OK;
-    }
+    // if (ip->saddr != bpf_htonl(TARGET_SITE) || ip->daddr != bpf_htonl(CLIENT_IP)) {
+    //     return TC_ACT_OK;
+    // }
 
     // IP total length field
     __u16 ip_len = bpf_ntohs(ip->tot_len);  
@@ -332,7 +332,7 @@ int tc_egress(struct __sk_buff *ctx) {
 
         // Setup temp buffer for csum calc
         __u32 i_key = 0;  // index key
-        struct rand_byte_buff_holder *rbbh = bpf_map_lookup_elem(&rand_byte_holder_map, &i_key);
+        struct rand_byte_buff_holder *rbbh = bpf_map_lookup_elem(&rand_byte_holder_map_eg, &i_key);
         if (!rbbh) {
             bpf_printk("Failed at rbb.\n");
             return TC_ACT_SHOT;
@@ -340,12 +340,18 @@ int tc_egress(struct __sk_buff *ctx) {
 
         __s64 tot_diff = 0;
 
+        __u32 pb1 = pad_st->pad_bytes;
+        if (pb1 > MAX_PAD) 
+            pb1 = MAX_PAD;
+        if (pb1 == 0)
+            return TC_ACT_SHOT;
+
         if (tcp_payload_len & 1) {
             __u8 last = 0;
             if (bpf_skb_load_bytes(ctx, init_pkt_len - 1, &last, 1))  // last byte of actual payload
                 return TC_ACT_SHOT;
 
-            if (bpf_skb_load_bytes(ctx, init_pkt_len, rbbh->bytes, pb)) {
+            if (bpf_skb_load_bytes(ctx, init_pkt_len, rbbh->bytes, pb1)) {
                 bpf_printk("Failed at load bytes rbbh 1.\n");
                 return TC_ACT_SHOT;
             }
@@ -362,14 +368,14 @@ int tc_egress(struct __sk_buff *ctx) {
                 return TC_ACT_SHOT;
             }
 
-            tot_diff = csum_diff_u8_buf(&rbbh->bytes[1], pb - 1, (__u32)tot_diff);
+            tot_diff = csum_diff_u8_buf(&rbbh->bytes[1], pb1 - 1, (__u32)tot_diff);
 
         } else {
-            if (bpf_skb_load_bytes(ctx, init_pkt_len, rbbh->bytes, pb)) {
+            if (bpf_skb_load_bytes(ctx, init_pkt_len, rbbh->bytes, pb1)) {
                 bpf_printk("Failed at load bytes rbbh 2.\n");
                 return TC_ACT_SHOT;
             }
-            tot_diff = csum_diff_u8_buf(rbbh->bytes, pb, 0);
+            tot_diff = csum_diff_u8_buf(rbbh->bytes, pb1, 0);
         }
 
         if (tot_diff < 0) {

@@ -62,7 +62,7 @@ struct {
     __type(key, __u32);
     __type(value, struct rand_byte_buff_holder);
     __uint(max_entries, 1);
-} rand_byte_holder_map SEC(".maps");
+} rand_byte_holder_map_ig SEC(".maps");
 
 /* Tail for all *modified* packets */
 struct pad_magic_tail {
@@ -282,7 +282,7 @@ int tc_ingress(struct __sk_buff *ctx) {
 
         // Store the random padded bytes to BPF_MAP for csum calc
         __u32 i_key = 0;  // index key
-        struct rand_byte_buff_holder *rbb = bpf_map_lookup_elem(&rand_byte_holder_map, &i_key);
+        struct rand_byte_buff_holder *rbb = bpf_map_lookup_elem(&rand_byte_holder_map_ig, &i_key);
         if (!rbb) 
             return TC_ACT_SHOT;
 

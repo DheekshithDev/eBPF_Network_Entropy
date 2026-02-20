@@ -117,7 +117,58 @@ static __always_inline bool is_HS_ACK(struct tcphdr *tcp, __u32 payload_len) {
     return false;
 }
 
-/* CSUM diff calculator for non-multiple of 4 lengths (in chunks) */
+/* CSUM diff calculator for non-multiple of 4 lengths (in chunks)*/
+static __always_inline __s64 csum_diff_u8_buf(const __u8 *buf, __u32 len, __u32 seed) {
+    __s64 diff = seed;
+    __u32 n;
+
+    #if MAX_CHUNKS > 0
+        n = len;
+        if (n > CSUM_CHUNK) n = CSUM_CHUNK;
+        n &= ~3u;
+        if (n) {
+            diff = bpf_csum_diff(0, 0, (__be32 *)(buf + 0), n, (__wsum)diff);
+            if (diff < 0) return diff;
+        }
+    #endif
+
+    #if MAX_CHUNKS > 1
+        // chunk 1
+        n = (len > CSUM_CHUNK) ? (len - CSUM_CHUNK) : 0;
+        if (n > CSUM_CHUNK) n = CSUM_CHUNK;
+        n &= ~3u;
+        if (n) {
+            diff = bpf_csum_diff(0, 0, (__be32 *)(buf + CSUM_CHUNK), n, (__wsum)diff);
+            if (diff < 0) return diff;
+        }
+    #endif
+
+    #if MAX_CHUNKS > 2
+        // chunk 2
+        n = (len > 2*CSUM_CHUNK) ? (len - 2*CSUM_CHUNK) : 0;
+        if (n > CSUM_CHUNK) n = CSUM_CHUNK;
+        n &= ~3u;
+        if (n) {
+            diff = bpf_csum_diff(0, 0, (__be32 *)(buf + 2*CSUM_CHUNK), n, (__wsum)diff);
+            if (diff < 0) return diff;
+        }
+    #endif
+
+    __u32 n4 = (len & ~3u);      // last 4-aligned boundary
+    __u32 rem = len & 3u;
+    if (rem) {
+        __u32 last = 0;
+        if (rem >= 1) ((__u8 *)&last)[0] = buf[n4 + 0];
+        if (rem >= 2) ((__u8 *)&last)[1] = buf[n4 + 1];
+        if (rem >= 3) ((__u8 *)&last)[2] = buf[n4 + 2];
+        diff = bpf_csum_diff(0, 0, (__be32 *)&last, 4, (__wsum)diff);
+        if (diff < 0) return diff;
+    }
+
+    return diff;
+}
+
+/* CSUM SUBTRACT diff calculator for non-multiple of 4 lengths (in chunks) */
 static __always_inline __s64 csum_sub_u8_buf(const __u8 *buf, __u32 len, __u32 seed) {  // Subtraction
     __s64 diff = seed;
     __u32 n;

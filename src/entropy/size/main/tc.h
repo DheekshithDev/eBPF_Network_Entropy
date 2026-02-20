@@ -168,6 +168,58 @@ static __always_inline __s64 csum_diff_u8_buf(const __u8 *buf, __u32 len, __u32 
     return diff;
 }
 
+/* CSUM SUBTRACT diff calculator for non-multiple of 4 lengths (in chunks) */
+static __always_inline __s64 csum_sub_u8_buf(const __u8 *buf, __u32 len, __u32 seed) {  // Subtraction
+    __s64 diff = seed;
+    __u32 n;
+
+    #if MAX_CHUNKS > 0
+        n = len;
+        if (n > CSUM_CHUNK) n = CSUM_CHUNK;
+        n &= ~3u;
+        if (n) {
+            diff = bpf_csum_diff((__be32 *)(buf + 0), n, 0, 0, (__wsum)diff);  // Subtract 
+            if (diff < 0) return diff;
+        }
+    #endif
+
+    #if MAX_CHUNKS > 1
+        // chunk 1
+        n = (len > CSUM_CHUNK) ? (len - CSUM_CHUNK) : 0;
+        if (n > CSUM_CHUNK) n = CSUM_CHUNK;
+        n &= ~3u;
+        if (n) {
+            diff = bpf_csum_diff((__be32 *)(buf + CSUM_CHUNK), n, 0, 0, (__wsum)diff);
+            if (diff < 0) return diff;
+        }
+    #endif
+
+    #if MAX_CHUNKS > 2
+        // chunk 2
+        n = (len > 2*CSUM_CHUNK) ? (len - 2*CSUM_CHUNK) : 0;
+        if (n > CSUM_CHUNK) n = CSUM_CHUNK;
+        n &= ~3u;
+        if (n) {
+            diff = bpf_csum_diff((__be32 *)(buf + 2*CSUM_CHUNK), n, 0, 0, (__wsum)diff);
+            if (diff < 0) return diff;
+        }
+    #endif
+
+    // tail (0..3)
+    __u32 n4 = (len & ~3u);      // last 4-aligned boundary
+    __u32 rem = len & 3u;
+    if (rem) {
+        __u32 last = 0;
+        if (rem >= 1) ((__u8 *)&last)[0] = buf[n4 + 0];
+        if (rem >= 2) ((__u8 *)&last)[1] = buf[n4 + 1];
+        if (rem >= 3) ((__u8 *)&last)[2] = buf[n4 + 2];
+        diff = bpf_csum_diff((__be32 *)&last, 4, 0, 0, (__wsum)diff);
+        if (diff < 0) return diff;
+    }
+
+    return diff;
+}
+
 /* RC5 */
 static const __u16 rc5_S[RC5_T] = {
     0xDE08, 0xEC8C, 0x37ED, 0x6F24, 0x33A7, 0xE067, 0x378C, 0xA6B3, 0x6D6B, 

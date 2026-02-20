@@ -19,9 +19,7 @@
 #define MAX_PAD (DEVICE_MTU)
 
 static volatile sig_atomic_t exiting = 0;
-
-static void sig_int(int signo)
-{
+static void sig_int(int signo) {
     exiting = 1;
 }
 

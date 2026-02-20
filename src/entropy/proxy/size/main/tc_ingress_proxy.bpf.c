@@ -31,7 +31,7 @@ struct {
     __type(key, __u32);
     __type(value, struct rand_byte_buff_holder);
     __uint(max_entries, 1);
-} rand_byte_holder_map SEC(".maps");
+} rand_byte_holder_map_ig SEC(".maps");
 
 /* BPF_MAP_TYPE_PERCPU_ARRAY for storing pad_bytes */
 struct pad_state_map pad_state_map SEC(".maps");
@@ -119,9 +119,9 @@ int tc_ingress(struct __sk_buff *ctx) {
         return TC_ACT_OK;
 
     // Only use this program on client-proxy traffic  *CRITICAL*
-    if (ip->saddr != bpf_htonl(CLIENT_IP) || ip->daddr != bpf_htonl(TARGET_SITE)) {
-        return TC_ACT_OK;
-    }
+    // if (ip->saddr != bpf_htonl(CLIENT_IP) || ip->daddr != bpf_htonl(TARGET_SITE)) {
+    //     return TC_ACT_OK;
+    // }
 
     // if (ip->saddr != bpf_htonl(CLIENT_IP) || tcp->dest != bpf_htons(4443)) {
     //     return TC_ACT_OK;
@@ -202,7 +202,7 @@ int tc_ingress(struct __sk_buff *ctx) {
         pad_st->pad_bytes = pad_bytes;
 
         __u32 i_key = 0;  // index key
-        struct rand_byte_buff_holder *rbbh = bpf_map_lookup_elem(&rand_byte_holder_map, &i_key);
+        struct rand_byte_buff_holder *rbbh = bpf_map_lookup_elem(&rand_byte_holder_map_ig, &i_key);
         if (!rbbh) {
             bpf_printk("Failed at rbbh.\n");
             return TC_ACT_SHOT;
