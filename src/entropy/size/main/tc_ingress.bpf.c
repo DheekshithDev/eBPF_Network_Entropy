@@ -5,15 +5,15 @@
 #include "tc.h"
 
 /* LRU HashMap for TC-Ingress to fix seq_num of current packet to original */
-struct seq_ingress_info {
-    __be32 seq_ingress;  // orig_seq
-};
-struct {  // I maintain this for myself
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 12292);
-    __type(key, struct flow);
-    __type(value, struct seq_ingress_info);
-} seq_ingress_fix SEC(".maps");
+// struct seq_ingress_info {
+//     __be32 seq_ingress;  // orig_seq
+// };
+// struct {  // I maintain this for myself
+//     __uint(type, BPF_MAP_TYPE_LRU_HASH);
+//     __uint(max_entries, 12292);
+//     __type(key, struct flow);
+//     __type(value, struct seq_ingress_info);
+// } seq_ingress_fix SEC(".maps");
 
 /* HAD to use this BPF_MAP_TYPE_PERCPU_ARRAY for csum recomputation */
 // Value //
@@ -33,10 +33,10 @@ int tc_ingress(struct __sk_buff *ctx) {
 
     /* Need to disable TSO/GSO on all network profiles */
     // Ignore GSO/TSO Packets still; *SHOULDN'T* see them in trace files
-    if (ctx->gso_segs > 1 || ctx->gso_size) {
-        bpf_printk("Packet is TSO/GSO; Ignoring.\n");
-        return TC_ACT_OK;
-    }
+    // if (ctx->gso_segs > 1 || ctx->gso_size) {
+    //     // bpf_printk("Packet is TSO/GSO; Ignoring.\n");
+    //     return TC_ACT_OK;
+    // }
 
     // I need this function to unclone the linear part of skb for writing
     if (bpf_skb_pull_data(ctx, 0)) {  // Returns 0 on success
@@ -114,44 +114,64 @@ int tc_ingress(struct __sk_buff *ctx) {
         return TC_ACT_OK;  // I don't need this packet; simply pass it
     }
 
-    /* Create ACK key to revert ingress ACK to original */
-    struct flow ack_ingress_key = {
-        .saddr = ip->daddr,
-        .daddr = ip->saddr,
-        .sport = tcp->dest,
-        .dport = tcp->source,
-    };
-    /* Create ACK key to modify Client Egress ACK to translated */
-    struct flow ack_egress_key = {
-        .saddr = ip->saddr,
-        .daddr = ip->daddr,
-        .sport = tcp->source,
-        .dport = tcp->dest,
-    };
-    /* Create SEQ key to fix ingress SEQ to original on current packet */
-    struct flow seq_ingress_key = {
-        .saddr = ip->saddr,
-        .daddr = ip->daddr,
-        .sport = tcp->source,
-        .dport = tcp->dest,
-    };
+    // /* Create ACK key to revert ingress ACK to original */
+    // struct flow ack_ingress_key = {
+    //     .saddr = ip->daddr,
+    //     .daddr = ip->saddr,
+    //     .sport = tcp->dest,
+    //     .dport = tcp->source,
+    // };
+    // /* Create ACK key to modify Client Egress ACK to translated */
+    // struct flow ack_egress_key = {
+    //     .saddr = ip->saddr,
+    //     .daddr = ip->daddr,
+    //     .sport = tcp->source,
+    //     .dport = tcp->dest,
+    // };
+    // /* Create SEQ key to fix ingress SEQ to original on current packet */
+    // struct flow seq_ingress_key = {
+    //     .saddr = ip->saddr,
+    //     .daddr = ip->daddr,
+    //     .sport = tcp->source,
+    //     .dport = tcp->dest,
+    // };
 
     // Store highest *modified* sequence of data that got received
-    __be32 highest_mdf_sent_data_len = 0;
-    struct ack_egress_info *is_retransmit = bpf_map_lookup_elem(&ack_egress_fix, &ack_egress_key);
-    if (is_retransmit) {
-        highest_mdf_sent_data_len = is_retransmit->ack_egress;
-    }
+    // __be32 highest_mdf_sent_data_len = 0;
+    // struct ack_egress_info *is_retransmit = bpf_map_lookup_elem(&ack_egress_fix, &ack_egress_key);
+    // if (is_retransmit) {
+    //     highest_mdf_sent_data_len = is_retransmit->ack_egress;
+    // }
 
     // Always add *modified* packet SEQ + data_sent to map to serve as ACK on Client Egress
-    struct ack_egress_info ack_egress_val = {
-        .ack_egress_orig = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len_modified),
-        .ack_egress = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len_modified),  // network-byte order
-    };
-    bpf_map_update_elem(&ack_egress_fix, &ack_egress_key, &ack_egress_val, BPF_ANY);
+    // struct ack_egress_info ack_egress_val = {
+    //     .ack_egress_orig = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len_modified),
+    //     .ack_egress = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len_modified),  // network-byte order
+    // };
+    // bpf_map_update_elem(&ack_egress_fix, &ack_egress_key, &ack_egress_val, BPF_ANY);
 
-    __be32 translated_seq_num = tcp->seq;  // *modified* seq_num of current pkt
-    __be32 orig_seq_num = tcp->seq;  // *actual* seq_num of current pkt (will be updated)
+    // __be32 translated_seq_num = tcp->seq;  // *modified* seq_num of current pkt
+    // __be32 orig_seq_num = tcp->seq;  // *actual* seq_num of current pkt (will be updated)
+
+    /* Decrypt Seq and Ack num */
+    __u8 ack_set = tcp->ack; 
+    __u32 trans_seq = bpf_ntohl(tcp->seq);
+    __u16 seq_hi16 = (__u16)(trans_seq >> 16);
+    __u16 seq_lo16 = (__u16)(trans_seq & 0xFFFF);
+    rc5_16_decrypt(&seq_hi16, &seq_lo16);
+    // Recombine and assign
+    __u32 seq = ((__u32)seq_hi16 << 16) | seq_lo16;
+    tcp->seq = bpf_htonl(seq);
+
+    __u32 trans_ack = bpf_ntohl(tcp->ack_seq);
+    __u32 ack = bpf_ntohl(tcp->ack_seq);
+    if (ack_set) {
+        __u16 ack_hi16 = (__u16)(trans_ack >> 16);
+        __u16 ack_lo16 = (__u16)(trans_ack & 0xFFFF);
+        rc5_16_decrypt(&ack_hi16, &ack_lo16);
+        ack = ((__u32)ack_hi16 << 16) | ack_lo16;
+        tcp->ack_seq = bpf_htonl(ack);
+    }
 
     // *Modified* packet length
     __u32 mdf_pkt_len = ctx->len;  // could be untampered normal packets too
@@ -251,27 +271,27 @@ int tc_ingress(struct __sk_buff *ctx) {
         __u32 tcp_payload_len_orig = ip_len - ip_hl - tcp_hl;  // all host-byte order
 
         // Update the field
-        ack_egress_val.ack_egress_orig = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len_orig);
+        // ack_egress_val.ack_egress_orig = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len_orig);
 
         // TCP SEQ FIX 
-        struct seq_ingress_info *seq_ingress_info = bpf_map_lookup_elem(&seq_ingress_fix, &seq_ingress_key);
-        if (seq_ingress_info) {  // seq_num exists in the map already; revert it to orig pkt seq_num
-            __be32 orig_seq = seq_ingress_info->seq_ingress;
-            // Check if the current packet is retransmit
-            if (highest_mdf_sent_data_len && !(tcp->seq < highest_mdf_sent_data_len)) {  // packet is *NOT* retransmit
-                tcp->seq = orig_seq;
-                orig_seq_num = orig_seq;
-                struct seq_ingress_info nxt_seq_val = {
-                    .seq_ingress = bpf_htonl(bpf_ntohl(orig_seq) + tcp_payload_len_orig),
-                };
-                bpf_map_update_elem(&seq_ingress_fix, &seq_ingress_key, &nxt_seq_val, BPF_ANY);  // only update
-            }
-        } else {  // First packet entry
-            struct seq_ingress_info nxt_seq_val = {
-                .seq_ingress = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len_orig),  // network-byte order
-            };
-            bpf_map_update_elem(&seq_ingress_fix, &seq_ingress_key, &nxt_seq_val, BPF_NOEXIST);  // BPF_NOEXIST secondary defense
-        }
+        // struct seq_ingress_info *seq_ingress_info = bpf_map_lookup_elem(&seq_ingress_fix, &seq_ingress_key);
+        // if (seq_ingress_info) {  // seq_num exists in the map already; revert it to orig pkt seq_num
+        //     __be32 orig_seq = seq_ingress_info->seq_ingress;
+        //     // Check if the current packet is retransmit
+        //     if (highest_mdf_sent_data_len && !(tcp->seq < highest_mdf_sent_data_len)) {  // packet is *NOT* retransmit
+        //         // tcp->seq = orig_seq;
+        //         orig_seq_num = orig_seq;
+        //         struct seq_ingress_info nxt_seq_val = {
+        //             .seq_ingress = bpf_htonl(bpf_ntohl(orig_seq) + tcp_payload_len_orig),
+        //         };
+        //         bpf_map_update_elem(&seq_ingress_fix, &seq_ingress_key, &nxt_seq_val, BPF_ANY);  // only update
+        //     }
+        // } else {  // First packet entry
+        //     struct seq_ingress_info nxt_seq_val = {
+        //         .seq_ingress = bpf_htonl(bpf_ntohl(tcp->seq) + tcp_payload_len_orig),  // network-byte order
+        //     };
+        //     bpf_map_update_elem(&seq_ingress_fix, &seq_ingress_key, &nxt_seq_val, BPF_NOEXIST);  // BPF_NOEXIST secondary defense
+        // }
 
         // TCP ACK FIX
         // Check if the ACK is what I expect with ==, if it is < what I expect, it could mean data is lost and next pkt would be retransmit
@@ -288,8 +308,6 @@ int tc_ingress(struct __sk_buff *ctx) {
 
             __u8 pad0 = rbbh->bytes[0];
 
-            // __u8 oldb[2] = { last, pad0 };
-            // __u8 newb[2] = { last, 0x00 };
             // bpf_csum_diff only accepts multiples of 4 for length param
             __be32 old32 = bpf_htonl(((__u32)last << 24) | ((__u32)pad0 << 16));
             __be32 new32 = bpf_htonl(((__u32)last << 24) | ((__u32)0x00 << 16));
@@ -323,10 +341,10 @@ int tc_ingress(struct __sk_buff *ctx) {
             return TC_ACT_SHOT;
         }
         // L4-TCP SEQ checksum replace to original
-        if (bpf_l4_csum_replace(ctx, ip_hl + offsetof(struct tcphdr, check), translated_seq_num, orig_seq_num, 4)) {  // all network-byte order
-            bpf_printk("Something went wrong with TCP->SEQ l4_csum_replace().\n");
-            return TC_ACT_SHOT;
-        }
+        // if (bpf_l4_csum_replace(ctx, ip_hl + offsetof(struct tcphdr, check), translated_seq_num, orig_seq_num, 4)) {  // all network-byte order
+        //     bpf_printk("Something went wrong with TCP->SEQ l4_csum_replace().\n");
+        //     return TC_ACT_SHOT;
+        // }
         // L4-TCP PSEUDO-header (Pseudo-IP) checksum replace to original
         __u16 modified_tcp_len = ip_len_modified - ip_hl;
         __u16 orig_tcp_len = ip_len - ip_hl;
@@ -334,32 +352,43 @@ int tc_ingress(struct __sk_buff *ctx) {
             bpf_printk("Something went wrong with PSEUDO l4_csum_replace().\n");
             return TC_ACT_SHOT;
         }
+    } 
+    // else {  // Un-padded packet
+    //     // TCP SEQ FIX 
+    //     // Check if the packet is the first packet of this flow
+    //     struct seq_ingress_info *seq_ingress_info = bpf_map_lookup_elem(&seq_ingress_fix, &seq_ingress_key);
+    //     if (seq_ingress_info) {
+    //         __be32 orig_seq = seq_ingress_info->seq_ingress;
+    //         // Check if the current packet is retransmit
+    //         if (highest_mdf_sent_data_len && !(tcp->seq < highest_mdf_sent_data_len)) {
+    //             // tcp->seq = orig_seq;
+    //             orig_seq_num = orig_seq;
+    //             struct seq_ingress_info nxt_seq_val = {
+    //                 .seq_ingress = bpf_htonl(bpf_ntohl(orig_seq) + tcp_payload_len_modified),  // this is not modified as the pkt is already full size
+    //             };
+    //             bpf_map_update_elem(&seq_ingress_fix, &seq_ingress_key, &nxt_seq_val, BPF_EXIST);  // only update
+    //             // L4-TCP SEQ checksum replace to original
+    //             // if (bpf_l4_csum_replace(ctx, ip_hl + offsetof(struct tcphdr, check), translated_seq_num, orig_seq_num, 4)) {  // all network-byte order
+    //             //     bpf_printk("Something went wrong with TCP->SEQ l4_csum_replace().\n");
+    //             //     return TC_ACT_SHOT;
+    //             // }
+    //         }
+    //     }  // else: first ever packet of this flow; do nothing
 
+    //     // TCP ACK FIX 
+    // }
 
-    } else {  // Un-padded packet
-        // TCP SEQ FIX 
-        // Check if the packet is the first packet of this flow
-        struct seq_ingress_info *seq_ingress_info = bpf_map_lookup_elem(&seq_ingress_fix, &seq_ingress_key);
-        if (seq_ingress_info) {
-            __be32 orig_seq = seq_ingress_info->seq_ingress;
-            // Check if the current packet is retransmit
-            if (highest_mdf_sent_data_len && !(tcp->seq < highest_mdf_sent_data_len)) {
-                tcp->seq = orig_seq;
-                orig_seq_num = orig_seq;
-                struct seq_ingress_info nxt_seq_val = {
-                    .seq_ingress = bpf_htonl(bpf_ntohl(orig_seq) + tcp_payload_len_modified),  // this is not modified as the pkt is already full size
-                };
-                bpf_map_update_elem(&seq_ingress_fix, &seq_ingress_key, &nxt_seq_val, BPF_EXIST);  // only update
-                // L4-TCP SEQ checksum replace to original
-                if (bpf_l4_csum_replace(ctx, ip_hl + offsetof(struct tcphdr, check), translated_seq_num, orig_seq_num, 4)) {  // all network-byte order
-                    bpf_printk("Something went wrong with TCP->SEQ l4_csum_replace().\n");
-                    return TC_ACT_SHOT;
-                }
-            }
-        }  // else: first ever packet of this flow; do nothing
-
-        // TCP ACK FIX 
-
+    // L4-TCP SEQ checksum replace
+    if (bpf_l4_csum_replace(ctx, ip_hl + offsetof(struct tcphdr, check), bpf_htonl(trans_seq), bpf_htonl(seq), 4)) {  // all network-byte order
+        bpf_printk("Something went wrong with TCP->SEQ l4_csum_replace().\n");
+        return TC_ACT_SHOT;
+    }
+    // L4-TCP ACK checksum replace
+    if (ack_set) {
+        if (bpf_l4_csum_replace(ctx, ip_hl + offsetof(struct tcphdr, check), bpf_htonl(trans_ack), bpf_htonl(ack), 4)) {  // all network-byte order
+            bpf_printk("Something went wrong with TCP->ACK_SEQ l4_csum_replace().\n");
+            return TC_ACT_SHOT;
+        }
     }
 
     return TC_ACT_OK;

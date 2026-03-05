@@ -33,36 +33,36 @@ struct pad_magic_tail {
 
 /*** BPF MAPS ***/
 // Universal Key //
-struct flow {
-    // Network-order
-    __be32 saddr, daddr;
-    __be16 sport, dport;
-};
+// struct flow {
+//     // Network-order
+//     __be32 saddr, daddr;
+//     __be16 sport, dport;
+// };
 
-/* LRU HashMap to fix ingress ACKs on current packet */
-struct ack_ingress_info {
-    __be32 ack_ingress;  // To fix ingress ACK to original
-};
-struct ack_ingress_fix_map {  // proxy egress gives this to me
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 12292);
-    __type(key, struct flow);
-    __type(value, struct ack_ingress_info);
-};
-extern struct ack_ingress_fix_map ack_ingress_fix SEC(".maps");
+// /* LRU HashMap to fix ingress ACKs on current packet */
+// struct ack_ingress_info {
+//     __be32 ack_ingress;  // To fix ingress ACK to original
+// };
+// struct ack_ingress_fix_map {  // proxy egress gives this to me
+//     __uint(type, BPF_MAP_TYPE_LRU_HASH);
+//     __uint(max_entries, 12292);
+//     __type(key, struct flow);
+//     __type(value, struct ack_ingress_info);
+// };
+// extern struct ack_ingress_fix_map ack_ingress_fix SEC(".maps");
 
-/* LRU HashMap to modify proxy egress ACKs */
-struct ack_egress_info {
-    __be32 ack_egress_orig;
-    __be32 ack_egress;
-};
-struct ack_egress_fix_map {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 12292);
-    __type(key, struct flow);
-    __type(value, struct ack_egress_info);
-};
-extern struct ack_egress_fix_map ack_egress_fix SEC(".maps");
+// /* LRU HashMap to modify proxy egress ACKs */
+// struct ack_egress_info {
+//     __be32 ack_egress_orig;
+//     __be32 ack_egress;
+// };
+// struct ack_egress_fix_map {
+//     __uint(type, BPF_MAP_TYPE_LRU_HASH);
+//     __uint(max_entries, 12292);
+//     __type(key, struct flow);
+//     __type(value, struct ack_egress_info);
+// };
+// extern struct ack_egress_fix_map ack_egress_fix SEC(".maps");
 
 /* BPF_MAP_TYPE_PERCPU_ARRAY for storing pad_bytes */
 struct pad_state {
@@ -108,7 +108,7 @@ static __always_inline bool is_HS_ACK(struct tcphdr *tcp, __u32 payload_len) {
     if (tcp->syn && tcp->ack && !tcp->rst)   return true;  // SYN-ACK (On Client-Egress, I don't need this check)
 
     /* Only ACKs */
-    if (!tcp->syn && tcp->ack && payload_len == 0)  return true;  // Any simple ACK (includes handshake ACK too)
+    // if (!tcp->syn && tcp->ack && payload_len == 0)  return true;  // Any simple ACK (includes handshake ACK too)
     /* Only Resets */
     if (tcp->rst)   return true;  // Reset flag found; don't touch
     /* Only FIN */
@@ -244,7 +244,7 @@ static __always_inline void rc5_16_encrypt(__u16 *A, __u16 *B) {
     b = (__u16)(b + rc5_S[1]);
 
 #pragma unroll
-    for (__u32 i = 1; i <= RC5_R; i++) {
+    for (int i = 1; i <= RC5_R; i++) {
         a = (__u16)(rol16((__u16)(a ^ b), b) + rc5_S[2*i]);
         b = (__u16)(rol16((__u16)(b ^ a), a) + rc5_S[2*i + 1]);
     }
@@ -256,7 +256,7 @@ static __always_inline void rc5_16_decrypt(__u16 *A, __u16 *B) {
     __u16 a = *A, b = *B;
 
 #pragma unroll
-    for (__u32 i = RC5_R; i >= 1; i--) {
+    for (int i = RC5_R; i > 0; i--) {
         b = (ror16((__u16)(b - rc5_S[2*i + 1]), a) ^ a);
         a = (ror16((__u16)(a - rc5_S[2*i]), b) ^ b);
     }
